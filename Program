@@ -1,0 +1,355 @@
+import sqlite3
+from datetime import datetime, timedelta
+
+DB_NAME = "warehouse_productivity.db"
+
+# -----------------------------
+# Database setup
+# -----------------------------
+
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+
+    # Employees
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS employees (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL
+        )
+    """)
+
+    # Shifts (sign in / sign out)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS shifts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            employee_id INTEGER NOT NULL,
+            shift_date TEXT NOT NULL,
+            start_time TEXT NOT NULL,
+            end_time TEXT,
+            FOREIGN KEY(employee_id) REFERENCES employees(id)
+        )
+    """)
+
+    # Activities (transactions)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS activities (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            employee_id INTEGER NOT NULL,
+            shift_id INTEGER NOT NULL,
+            timestamp TEXT NOT NULL,
+            activity_type TEXT NOT NULL,
+            units INTEGER NOT NULL,
+            product_code TEXT,
+            FOREIGN KEY(employee_id) REFERENCES employees(id),
+            FOREIGN KEY(shift_id) REFERENCES shifts(id)
+        )
+    """)
+
+    # Safety events
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS safety_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            employee_id INTEGER,
+            shift_id INTEGER,
+            timestamp TEXT NOT NULL,
+            description TEXT NOT NULL,
+            severity TEXT,
+            FOREIGN KEY(employee_id) REFERENCES employees(id),
+            FOREIGN KEY(shift_id) REFERENCES shifts(id)
+        )
+    """)
+
+    # Quality events
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS quality_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            employee_id INTEGER,
+            shift_id INTEGER,
+            timestamp TEXT NOT NULL,
+            issue_type TEXT NOT NULL,  -- mispick, damage, wrong product, loading error, putaway error
+            description TEXT,
+            FOREIGN KEY(employee_id) REFERENCES employees(id),
+            FOREIGN KEY(shift_id) REFERENCES shifts(id)
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+# -----------------------------
+# Employee management
+# -----------------------------
+
+def add_employee(emp_id: int, name: str):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO employees (id, name) VALUES (?, ?)", (emp_id, name))
+    conn.commit()
+    conn.close()
+
+
+# -----------------------------
+# Shift management
+# -----------------------------
+
+def start_shift(employee_id: int) -> int:
+    """Employee signs in at start of shift. Returns shift_id."""
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    now = datetime.now()
+    shift_date = now.date().isoformat()
+    c.execute("""
+        INSERT INTO shifts (employee_id, shift_date, start_time)
+        VALUES (?, ?, ?)
+    """, (employee_id, shift_date, now.isoformat()))
+    shift_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return shift_id
+
+
+def end_shift(shift_id: int):
+    """Employee signs out at end of shift."""
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    now = datetime.now().isoformat()
+    c.execute("UPDATE shifts SET end_time = ? WHERE id = ?", (now, shift_id))
+    conn.commit()
+    conn.close()
+
+
+# -----------------------------
+# Activity logging
+# -----------------------------
+
+VALID_ACTIVITIES = [
+    "case_picking",
+    "pallet_picking",
+    "case_putaway",
+    "pallet_putaway",
+    "loading_trucks",
+    "unloading_trucks"
+]
+
+def log_activity(employee_id: int, shift_id: int, activity_type: str, units: int, product_code: str = None):
+    """
+    Log a transaction. 'units' is the industrial engineering standard unit
+    (e.g., cases, pallets, lines, etc.).
+    """
+    if activity_type not in VALID_ACTIVITIES:
+        raise ValueError(f"Invalid activity_type: {activity_type}")
+
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    now = datetime.now().isoformat()
+    c.execute("""
+        INSERT INTO activities (employee_id, shift_id, timestamp, activity_type, units, product_code)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (employee_id, shift_id, now, activity_type, units, product_code))
+    conn.commit()
+    conn.close()
+
+
+# -----------------------------
+# Safety & Quality logging
+# -----------------------------
+
+def log_safety_event(employee_id: int, shift_id: int, description: str, severity: str = None):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    now = datetime.now().isoformat()
+    c.execute("""
+        INSERT INTO safety_events (employee_id, shift_id, timestamp, description, severity)
+        VALUES (?, ?, ?, ?, ?)
+    """, (employee_id, shift_id, now, description, severity))
+    conn.commit()
+    conn.close()
+
+
+def log_quality_event(employee_id: int, shift_id: int, issue_type: str, description: str = None):
+    """
+    issue_type examples: 'mispick', 'damage', 'wrong_product', 'loading_error', 'putaway_error'
+    """
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    now = datetime.now().isoformat()
+    c.execute("""
+        INSERT INTO quality_events (employee_id, shift_id, timestamp, issue_type, description)
+        VALUES (?, ?, ?, ?, ?)
+    """, (employee_id, shift_id, now, issue_type, description))
+    conn.commit()
+    conn.close()
+
+
+# -----------------------------
+# Productivity calculations
+# -----------------------------
+
+def _get_shift_duration_hours(shift_row) -> float:
+    start = datetime.fromisoformat(shift_row[3])
+    end_str = shift_row[4]
+    if not end_str:
+        end = datetime.now()
+    else:
+        end = datetime.fromisoformat(end_str)
+    duration = end - start
+    return max(duration.total_seconds() / 3600.0, 0.0001)  # avoid divide by zero
+
+
+def get_employee_productivity(employee_id: int, shift_date: str = None):
+    """
+    Returns units per hour by activity for a given employee.
+    If shift_date is None, uses today's date.
+    """
+    if shift_date is None:
+        shift_date = datetime.now().date().isoformat()
+
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+
+    # Get shifts for that date
+    c.execute("""
+        SELECT id, employee_id, shift_date, start_time, end_time
+        FROM shifts
+        WHERE employee_id = ? AND shift_date = ?
+    """, (employee_id, shift_date))
+    shifts = c.fetchall()
+
+    productivity = {}  # {activity_type: {"units": x, "hours": y, "uph": z}}
+
+    for shift in shifts:
+        shift_id = shift[0]
+        duration_hours = _get_shift_duration_hours(shift)
+
+        c.execute("""
+            SELECT activity_type, SUM(units)
+            FROM activities
+            WHERE employee_id = ? AND shift_id = ?
+            GROUP BY activity_type
+        """, (employee_id, shift_id))
+        rows = c.fetchall()
+
+        for activity_type, total_units in rows:
+            if activity_type not in productivity:
+                productivity[activity_type] = {"units": 0, "hours": 0.0}
+            productivity[activity_type]["units"] += total_units
+            productivity[activity_type]["hours"] += duration_hours
+
+    # Calculate units per hour
+    for activity_type, data in productivity.items():
+        data["uph"] = data["units"] / data["hours"] if data["hours"] > 0 else 0.0
+
+    conn.close()
+    return productivity
+
+
+# -----------------------------
+# Dashboard (text-based)
+# -----------------------------
+
+def dashboard_for_day(shift_date: str = None):
+    """
+    Simple console dashboard for supervisors/managers:
+    - Productivity by employee and activity
+    - Safety events
+    - Quality events
+    """
+    if shift_date is None:
+        shift_date = datetime.now().date().isoformat()
+
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+
+    print(f"\n=== DASHBOARD FOR {shift_date} ===")
+
+    # Employees signed in that day
+    c.execute("""
+        SELECT DISTINCT e.id, e.name
+        FROM employees e
+        JOIN shifts s ON e.id = s.employee_id
+        WHERE s.shift_date = ?
+    """, (shift_date,))
+    employees = c.fetchall()
+
+    # Productivity section
+    print("\n--- Productivity (Units per Hour by Activity) ---")
+    for emp_id, name in employees:
+        prod = get_employee_productivity(emp_id, shift_date)
+        print(f"\nEmployee {emp_id} - {name}")
+        if not prod:
+            print("  No activity logged.")
+            continue
+        for activity_type, data in prod.items():
+            print(f"  {activity_type}: Units={data['units']:.2f}, Hours={data['hours']:.2f}, UPH={data['uph']:.2f}")
+
+    # Safety section
+    print("\n--- Safety Events ---")
+    c.execute("""
+        SELECT se.timestamp, e.name, se.description, se.severity
+        FROM safety_events se
+        LEFT JOIN employees e ON se.employee_id = e.id
+        LEFT JOIN shifts s ON se.shift_id = s.id
+        WHERE s.shift_date = ?
+    """, (shift_date,))
+    safety_rows = c.fetchall()
+    if not safety_rows:
+        print("  No safety events.")
+    else:
+        for ts, name, desc, sev in safety_rows:
+            print(f"  [{ts}] Employee={name or 'N/A'} Severity={sev or 'N/A'} Desc={desc}")
+
+    # Quality section
+    print("\n--- Quality Events ---")
+    c.execute("""
+        SELECT qe.timestamp, e.name, qe.issue_type, qe.description
+        FROM quality_events qe
+        LEFT JOIN employees e ON qe.employee_id = e.id
+        LEFT JOIN shifts s ON qe.shift_id = s.id
+        WHERE s.shift_date = ?
+    """, (shift_date,))
+    quality_rows = c.fetchall()
+    if not quality_rows:
+        print("  No quality events.")
+    else:
+        for ts, name, issue_type, desc in quality_rows:
+            print(f"  [{ts}] Employee={name or 'N/A'} Issue={issue_type} Desc={desc or ''}")
+
+    conn.close()
+
+
+# -----------------------------
+# Example usage / CLI stub
+# -----------------------------
+
+def main():
+    init_db()
+
+    # Example: create employees 1–3
+    add_employee(1, "Alice")
+    add_employee(2, "Bob")
+    add_employee(3, "Carlos")
+
+    # Start shifts
+    shift1 = start_shift(1)
+    shift2 = start_shift(2)
+
+    # Log activities (these would normally be triggered by scanner events)
+    log_activity(1, shift1, "case_picking", 120, product_code="CASE123")
+    log_activity(1, shift1, "pallet_picking", 15, product_code="PALLET45")
+    log_activity(2, shift2, "loading_trucks", 80, product_code="LOAD789")
+
+    # Safety & Quality examples
+    log_safety_event(1, shift1, "Minor slip in aisle 3", severity="Minor")
+    log_quality_event(2, shift2, "mispick", "Wrong SKU loaded on truck 12")
+
+    # End shifts
+    end_shift(shift1)
+    end_shift(shift2)
+
+    # Show dashboard
+    dashboard_for_day()
+
+if __name__ == "__main__":
+    main()
